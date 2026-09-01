@@ -1,0 +1,28 @@
+[
+  {
+    "name": "Response Times",
+    "fy_column": "FYLabel",
+    "index_name": "90% Fractile",
+    "rows": [
+      { "kind": "sum", "source": "Incident Count", "label": "Incidents", "format": "int" },
+      { "kind": "weighted_time", "source": "Turnout Time", "weight": "Incident Count", "label": "Turnout Time" },
+      { "kind": "weighted_time", "source": "Travel Time", "weight": "Incident Count", "label": "Travel Time" },
+      { "kind": "weighted_time", "source": "Total Response Time", "weight": "Incident Count", "label": "TRT" }
+    ]
+  },
+  {
+    "name": "Unit Workload",
+    "fy_column": null,
+    "index_name": "Unit Workload",
+    "rows": [
+      { "kind": "sum", "source": "First-due unit responses in first due", "label": "First-due unit responses in first due", "format": "int" },
+      { "kind": "sum", "source": "Unit workload (all areas)", "label": "Unit workload (all areas)", "format": "int" },
+      {
+        "kind": "ratio",
+        "numerator": "First-due unit responses in first due",
+        "denominator": "Unit workload (all areas)",
+        "label": "% unit workload in first due"
+      }
+    ]
+  }
+]
