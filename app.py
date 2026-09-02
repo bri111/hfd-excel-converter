@@ -26,7 +26,9 @@ def parse_year(label):
     # combined rows; skip them since the app recomputes the combined column.
     if re.fullmatch(r"(?:FY)?\s*\d{1,2}\s*-\s*\d{1,2}", text, flags=re.IGNORECASE):
         return None
-    match = re.search(r"(\d{4})", text)
+    # Standalone 4-digit token only (not embedded in a longer digit run) so
+    # a plain large number like "504623" doesn't get misread as year 5046.
+    match = re.search(r"(?<!\d)(\d{4})(?!\d)", text)
     if match:
         return int(match.group(1))
     match = re.fullmatch(r"(?:FY)?\s*(\d{2})", text, flags=re.IGNORECASE)
@@ -136,6 +138,8 @@ def required_columns(report_type):
 
 def detect_report_type(df):
     for report_type in REPORT_TYPES:
+        if report_type["fy_column"] and find_column(df, report_type["fy_column"]) is None:
+            continue
         if all(find_column(df, col) is not None for col in required_columns(report_type)):
             return report_type
     return None
@@ -143,6 +147,10 @@ def detect_report_type(df):
 
 def build_summary(df, report_type):
     fy_col = find_column(df, report_type["fy_column"]) if report_type["fy_column"] else df.columns[0]
+    if fy_col is None:
+        raise ValueError(
+            f"This CSV has no '{report_type['fy_column']}' column, which {report_type['name']} requires."
+        )
 
     work = df.copy()
     work["_year"] = work[fy_col].apply(parse_year)
@@ -186,6 +194,100 @@ def build_summary(df, report_type):
                 summary.loc[label, col] = format_value(num / den if den else None, "percent")
 
     summary.index.name = report_type["index_name"]
+    return summary
+
+
+GENERAL_MODE = "General"
+
+TIME_PATTERN = re.compile(r"^-?\d{1,2}:\d{2}(:\d{2})?$")
+
+
+def detect_fy_column(df):
+    best_col, best_score = None, 0
+    for col in df.columns:
+        parsed = df[col].apply(parse_year)
+        score = parsed.notna().sum()
+        if score > best_score:
+            best_col, best_score = col, score
+    return best_col
+
+
+def sniff_column_kind(series, header):
+    header_l = str(header).strip().lower()
+    sample = series.dropna().astype(str).str.strip().head(20)
+
+    if sample.str.match(TIME_PATTERN).any() or "time" in header_l:
+        return "time"
+    if sample.str.contains("%", regex=False).any() or "%" in header_l or "percent" in header_l or "rate" in header_l:
+        return "percent"
+    return "number"
+
+
+OPERATIONS = ["Sum", "Average", "Ratio (%)", "Skip"]
+
+
+def default_operation(kind):
+    return {"time": "Average", "percent": "Average", "number": "Sum"}[kind]
+
+
+def get_series_values_and_format(series, kind):
+    if kind == "time":
+        return series.apply(time_to_seconds), "time"
+    if kind == "percent":
+        return to_numeric(series) / 100, "percent"
+    return to_numeric(series), "int"
+
+
+def build_custom_summary(df, fy_col, specs):
+    """specs: list of {source, op, other_col, label} — one per included column.
+    op is one of OPERATIONS (excluding "Skip", which the caller should have
+    already filtered out); other_col is the denominator column name, required
+    for "Ratio (%)".
+    """
+    if not specs:
+        raise ValueError("No columns selected — check at least one column to include.")
+
+    work = df.copy()
+    work["_year"] = work[fy_col].apply(parse_year)
+    work = work[work["_year"].notna()]
+    if work.empty:
+        raise ValueError("Could not find any rows with a parseable FY year.")
+
+    work = work.sort_values("_year", ascending=False)
+
+    years = work["_year"].astype(int).tolist()
+    year_labels = [f"FY{y % 100:02d}" for y in years]
+    combined_label = f"FY{min(years) % 100:02d}-{max(years) % 100:02d}"
+    columns = [combined_label] + year_labels
+
+    summary = pd.DataFrame(index=[spec["label"] for spec in specs], columns=columns)
+
+    for spec in specs:
+        label = spec["label"]
+        op = spec["op"]
+
+        if op == "Ratio (%)":
+            numerator = to_numeric(work[spec["source"]])
+            denominator = to_numeric(work[spec["other_col"]])
+            combined = numerator.sum() / denominator.sum()
+            summary.loc[label, combined_label] = format_value(combined, "percent")
+            for col, num, den in zip(year_labels, numerator, denominator):
+                summary.loc[label, col] = format_value(num / den if den else None, "percent")
+            continue
+
+        kind = sniff_column_kind(work[spec["source"]], spec["source"])
+        values, fmt = get_series_values_and_format(work[spec["source"]], kind)
+
+        if op == "Sum":
+            combined = values.sum()
+        elif op == "Average":
+            combined = values.mean()
+
+        summary.loc[label, combined_label] = format_value(combined, fmt)
+        for year_col, value in zip(year_labels, values):
+            summary.loc[label, year_col] = format_value(value, fmt)
+
+    summary.index.name = "Summary"
     return summary
 
 
@@ -241,41 +343,115 @@ st.caption("Upload one or more raw CSVs and get back each one's transposed FY su
 
 uploaded_files = st.file_uploader("Upload CSV(s)", type=["csv"], accept_multiple_files=True)
 
+MODE_OPTIONS = [GENERAL_MODE] + [rt["name"] for rt in REPORT_TYPES]
+
+
 if uploaded_files:
-    results = []
-    for uploaded in uploaded_files:
-        try:
-            raw_df = pd.read_csv(uploaded)
-            report_type = detect_report_type(raw_df)
-            if report_type is None:
-                raise ValueError(
-                    "Unrecognized CSV format — no known report type matches these columns."
-                )
-            summary_df = build_summary(raw_df, report_type)
-        except ValueError as e:
-            st.error(f"{uploaded.name}: {e}")
-            continue
-        results.append((uploaded.name, report_type, summary_df))
+    tabs = st.tabs([f.name for f in uploaded_files]) if len(uploaded_files) > 1 else [st.container()]
 
-    combined_bytes = None
-    if len(results) > 1:
-        used_names = set()
-        combined = {
-            sanitize_sheet_name(name, used_names): summary_df for name, _, summary_df in results
-        }
-        combined_bytes = to_excel_bytes(combined)
+    results = []  # (file_name, mode, summary_df) for every file that built successfully
+    combined_slots = []  # placeholders to backfill with the combined download button
 
-    tabs = st.tabs([name for name, _, _ in results]) if len(results) > 1 else [st.container()]
-    for (name, report_type, summary_df), tab in zip(results, tabs):
+    for uploaded, tab in zip(uploaded_files, tabs):
         with tab:
-            st.subheader(f"Summary — {name} ({report_type['name']})")
+            name = uploaded.name
+            try:
+                raw_df = pd.read_csv(uploaded)
+            except Exception as e:
+                st.error(f"{name}: could not read CSV ({e})")
+                continue
+
+            soc_match = detect_report_type(raw_df)
+            default_mode = soc_match["name"] if soc_match else GENERAL_MODE
+            selected_mode = st.selectbox(
+                "Report mode",
+                MODE_OPTIONS,
+                index=MODE_OPTIONS.index(default_mode),
+                key=f"mode_{name}",
+                help="General: pick per-column how years combine. "
+                     "SOC Reporting: incident-weighted averages for response-time metrics.",
+            )
+
+            summary_df = None
+            if selected_mode == GENERAL_MODE:
+                fy_options = list(raw_df.columns)
+                default_fy = detect_fy_column(raw_df) or fy_options[0]
+                fy_col = st.selectbox(
+                    "FY / Year column",
+                    fy_options,
+                    index=fy_options.index(default_fy),
+                    key=f"fycol_{name}",
+                )
+                metric_cols = [c for c in raw_df.columns if c != fy_col]
+                if not metric_cols:
+                    st.error(f"{name}: no columns left to summarize besides the FY column.")
+                    continue
+
+                config_df = pd.DataFrame({
+                    "Include": [True] * len(metric_cols),
+                    "Column": [str(c) for c in metric_cols],
+                    "Operation": [
+                        default_operation(sniff_column_kind(raw_df[c], c)) for c in metric_cols
+                    ],
+                    "Divide by": [""] * len(metric_cols),
+                    "Label": [str(c) for c in metric_cols],
+                })
+
+                st.caption(
+                    "Check off which columns to include, and how each should combine "
+                    "across years. Ratio (%) needs a column picked in \"Divide by\"."
+                )
+                edited = st.data_editor(
+                    config_df,
+                    column_config={
+                        "Include": st.column_config.CheckboxColumn(),
+                        "Column": st.column_config.TextColumn(disabled=True),
+                        "Operation": st.column_config.SelectboxColumn(options=OPERATIONS),
+                        "Divide by": st.column_config.SelectboxColumn(
+                            options=[""] + [str(c) for c in metric_cols]
+                        ),
+                        "Label": st.column_config.TextColumn(),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    key=f"editor_{name}",
+                )
+
+                specs = []
+                for _, row in edited.iterrows():
+                    if not row["Include"] or row["Operation"] == "Skip":
+                        continue
+                    if row["Operation"] == "Ratio (%)" and not row["Divide by"]:
+                        st.warning(f"\"{row['Column']}\": pick a column to divide by, or it's skipped.")
+                        continue
+                    specs.append({
+                        "source": row["Column"],
+                        "op": row["Operation"],
+                        "other_col": row["Divide by"] or None,
+                        "label": row["Label"] or row["Column"],
+                    })
+
+                try:
+                    summary_df = build_custom_summary(raw_df, fy_col, specs)
+                except ValueError as e:
+                    st.error(f"{name}: {e}")
+                    continue
+            else:
+                report_type = next(rt for rt in REPORT_TYPES if rt["name"] == selected_mode)
+                try:
+                    summary_df = build_summary(raw_df, report_type)
+                except ValueError as e:
+                    st.error(f"{name}: {e}")
+                    continue
+
+            st.subheader(f"Summary — {name} ({selected_mode})")
             st.dataframe(summary_df, use_container_width=True)
 
             sheet_name = sanitize_sheet_name(name, set())
             excel_bytes = to_excel_bytes({sheet_name: summary_df})
             out_name = re.sub(r"\.csv$", "", name, flags=re.IGNORECASE) + "_summary.xlsx"
 
-            if combined_bytes is not None:
+            if len(uploaded_files) > 1:
                 _, col1, col2, _ = st.columns([1, 2, 2, 1])
             else:
                 _, col1, _ = st.columns([1, 2, 1])
@@ -292,13 +468,29 @@ if uploaded_files:
                 )
             if col2 is not None:
                 with col2:
-                    st.download_button(
-                        "Download all as one Excel file",
-                        data=combined_bytes,
-                        file_name="hfd_summary_combined.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"download_combined_{name}",
-                        use_container_width=True,
-                    )
+                    combined_slots.append(st.empty())
+
+            results.append((name, selected_mode, summary_df))
+
+    # Combined workbook depends on every tab's (possibly just-edited) summary,
+    # so it's only known after the loop above — the column slots reserved
+    # inside each tab are backfilled here rather than computed in advance.
+    if len(results) > 1:
+        used_names = set()
+        combined = {sanitize_sheet_name(n, used_names): df for n, _, df in results}
+        combined_bytes = to_excel_bytes(combined)
+        for slot, (name, _, _) in zip(combined_slots, results):
+            slot.download_button(
+                "Download all as one Excel file",
+                data=combined_bytes,
+                file_name="hfd_summary_combined.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_combined_{name}",
+                use_container_width=True,
+            )
 else:
-    st.info("Upload one or more raw CSVs. The report type (response times, unit workload, etc.) is detected automatically from the columns.")
+    st.info(
+        "Upload one or more raw CSVs. Each one defaults to General mode, where you "
+        "check off per column how it should combine across years — unless it matches "
+        "a specific mode like SOC Reporting, which you can still switch away from."
+    )
